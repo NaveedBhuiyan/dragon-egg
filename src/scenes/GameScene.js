@@ -10,6 +10,7 @@ import {
   DRAGON_TINTS,
   SPRITE_SCALE,
 } from '../gameConfig.js';
+import backgroundUrl from '../assets/background.jpg';
 
 const ROCK_ORDER = Object.keys(ROCK_TYPES);
 
@@ -29,6 +30,7 @@ export default class GameScene extends Phaser.Scene {
   }
 
   preload() {
+    this.load.image('background', backgroundUrl);
     for (const [key, url] of Object.entries(SPRITES)) {
       this.load.image(key, url);
     }
@@ -90,15 +92,9 @@ export default class GameScene extends Phaser.Scene {
   // ---------- world ----------
 
   buildWorld() {
-    this.add.rectangle(0, 0, WORLD.width, WORLD.height, 0x1f2b1a).setOrigin(0, 0);
-    const grid = this.add.graphics();
-    grid.lineStyle(1, 0xffffff, 0.05);
-    for (let x = 0; x <= WORLD.width; x += 100) {
-      grid.lineBetween(x, 0, x, WORLD.height);
-    }
-    for (let y = 0; y <= WORLD.height; y += 100) {
-      grid.lineBetween(0, y, WORLD.width, y);
-    }
+    const bg = this.add.image(WORLD.width / 2, WORLD.height / 2, 'background');
+    const coverScale = Math.max(WORLD.width / bg.width, WORLD.height / bg.height);
+    bg.setDisplaySize(bg.width * coverScale, bg.height * coverScale);
   }
 
   buildNestVisuals() {
@@ -179,9 +175,14 @@ export default class GameScene extends Phaser.Scene {
 
   buildHud() {
     const style = { fontFamily: 'monospace', fontSize: '15px', color: '#e5e7eb' };
+    const panelColor = 0x000000;
+    const panelAlpha = 0.5;
 
+    this.topLeftPanelBg = this.add.rectangle(0, 0, 250, 146, panelColor, panelAlpha).setOrigin(0, 0).setDepth(999).setScrollFactor(0);
     this.resourceText = this.add.text(16, 16, '', style).setDepth(1000).setScrollFactor(0);
     this.nestText = this.add.text(16, 96, '', style).setDepth(1000).setScrollFactor(0);
+
+    this.topRightPanelBg = this.add.rectangle(0, 0, 170, 50, panelColor, panelAlpha).setOrigin(1, 0).setDepth(999).setScrollFactor(0);
     this.tierText = this.add.text(0, 16, '', style).setDepth(1000).setScrollFactor(0).setOrigin(1, 0);
 
     this.eggHpBarBg = this.add.rectangle(0, 16, 240, 18, 0x000000, 0.45).setDepth(1000).setScrollFactor(0);
@@ -192,12 +193,14 @@ export default class GameScene extends Phaser.Scene {
       .setScrollFactor(0)
       .setOrigin(0.5);
 
+    this.promptPanelBg = this.add.rectangle(0, 0, 10, 34, panelColor, panelAlpha).setOrigin(0.5).setDepth(999).setScrollFactor(0).setVisible(false);
     this.promptText = this.add
       .text(0, 0, '', { fontFamily: 'monospace', fontSize: '17px', color: '#fde68a' })
       .setDepth(1000)
       .setScrollFactor(0)
       .setOrigin(0.5);
 
+    this.bottomLeftPanelBg = this.add.rectangle(0, 0, 560, 30, panelColor, panelAlpha).setOrigin(0, 0.5).setDepth(999).setScrollFactor(0);
     this.instructionsText = this.add
       .text(16, 0, 'Move: WASD/Arrows   Attack: SPACE   Interact/Build: E   Egg: Q', {
         fontFamily: 'monospace',
@@ -205,8 +208,10 @@ export default class GameScene extends Phaser.Scene {
         color: '#9ca3af',
       })
       .setDepth(1000)
-      .setScrollFactor(0);
+      .setScrollFactor(0)
+      .setOrigin(0, 0.5);
 
+    this.messagePanelBg = this.add.rectangle(0, 0, 10, 30, panelColor, panelAlpha).setOrigin(0.5).setDepth(999).setScrollFactor(0).setVisible(false);
     this.messageText = this.add
       .text(0, 0, '', { fontFamily: 'monospace', fontSize: '15px', color: '#fca5a5' })
       .setDepth(1000)
@@ -236,13 +241,17 @@ export default class GameScene extends Phaser.Scene {
   }
 
   layoutHud(width, height) {
+    this.topRightPanelBg.setPosition(width - 16, 6);
     this.tierText.setPosition(width - 16, 16);
     this.eggHpBarBg.setPosition(width / 2, 16);
     this.eggHpBarFill.setPosition(width / 2 - 120, 16);
     this.eggHpLabel.setPosition(width / 2, 16);
     this.promptText.setPosition(width / 2, height - 90);
+    this.promptPanelBg.setPosition(width / 2, height - 90);
+    this.bottomLeftPanelBg.setPosition(0, height - 28);
     this.instructionsText.setPosition(16, height - 28);
     this.messageText.setPosition(width / 2, height - 130);
+    this.messagePanelBg.setPosition(width / 2, height - 130);
     this.centerPanelBg.setPosition(width / 2, height / 2);
     this.centerPortrait.setPosition(width / 2, height / 2 - 110);
     this.centerTitle.setPosition(width / 2, height / 2 + 60);
@@ -639,12 +648,24 @@ export default class GameScene extends Phaser.Scene {
     }
 
     this.promptText.setText(this.computePrompt());
+    this.fitPanelToText(this.promptPanelBg, this.promptText, 24, 14);
 
     if (time < this.transientMessageUntil) {
       this.messageText.setText(this.transientMessage);
     } else {
       this.messageText.setText('');
     }
+    this.fitPanelToText(this.messagePanelBg, this.messageText, 24, 12);
+  }
+
+  fitPanelToText(panel, text, paddingX, paddingY) {
+    if (text.text.length === 0) {
+      panel.setVisible(false);
+      return;
+    }
+    panel.setVisible(true);
+    panel.width = text.width + paddingX;
+    panel.height = text.height + paddingY;
   }
 
   computePrompt() {
