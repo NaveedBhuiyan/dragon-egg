@@ -11,5 +11,8 @@ new Phaser.Game({
     width: window.innerWidth,
     height: window.innerHeight,
   },
+  input: {
+    activePointers: 3,
+  },
   scene: [GameScene],
 });

@@ -23,6 +23,11 @@ const EGG_HATCH_FRAMES = [1, 2, 3, 4].map((n) => ({ key: `egg_hatch_${String(n).
 const DRAGON_IDLE_FRAMES = [1, 2, 3, 4].map((n) => ({ key: `dragon_front_${String(n).padStart(2, '0')}` }));
 const DRAGON_WALK_FRAMES = [1, 2, 3, 4].map((n) => ({ key: `dragon_walk_${String(n).padStart(2, '0')}` }));
 
+const COMPACT_WIDTH_THRESHOLD = 700;
+const JOYSTICK_RADIUS = 50;
+const JOYSTICK_HIT_RADIUS = 80;
+const JOYSTICK_DEAD_ZONE = 10;
+
 export default class GameScene extends Phaser.Scene {
   constructor() {
     super('GameScene');
@@ -51,6 +56,13 @@ export default class GameScene extends Phaser.Scene {
     this.transientMessageUntil = 0;
     this.raiders = [];
 
+    this.inputState = { moveX: 0, moveY: 0, interact: false, eggAction: false, attack: false };
+    this.keyboardMoving = false;
+    this.isTouch = this.sys.game.device.input.touch;
+    this.orientationBlocked = false;
+    this.compactHud = false;
+    this.safeArea = this.probeSafeArea();
+
     this.createAnimations();
     this.buildWorld();
     this.buildNestVisuals();
@@ -59,14 +71,32 @@ export default class GameScene extends Phaser.Scene {
     this.buildPlayer();
     this.buildHud();
     this.buildInput();
+    this.buildTouchControls();
+    this.buildOrientationOverlay();
 
     this.cameras.main.setBounds(0, 0, WORLD.width, WORLD.height);
     this.cameras.main.startFollow(this.playerContainer, true, 0.09, 0.09);
 
     this.scale.on('resize', (gameSize) => {
       this.cameras.main.setViewport(0, 0, gameSize.width, gameSize.height);
+      this.safeArea = this.probeSafeArea();
+      this.checkOrientation();
       this.layoutHud(gameSize.width, gameSize.height);
     });
+
+    // Some mobile browsers report a stale viewport size to ResizeObserver right
+    // after rotation; force Phaser to recompute so the 'resize' handler above
+    // always fires with correct dimensions.
+    const forceRescale = () => this.scale.refresh();
+    window.addEventListener('resize', forceRescale);
+    window.addEventListener('orientationchange', forceRescale);
+    this.events.once('shutdown', () => {
+      window.removeEventListener('resize', forceRescale);
+      window.removeEventListener('orientationchange', forceRescale);
+    });
+
+    this.checkOrientation();
+    this.layoutHud(this.scale.width, this.scale.height);
 
     this.scheduleTierIncrease();
     this.scheduleNextSpawn();
@@ -241,25 +271,55 @@ export default class GameScene extends Phaser.Scene {
       .setOrigin(0.5)
       .setVisible(false);
 
-    this.layoutHud(this.scale.width, this.scale.height);
+    if (this.isTouch) {
+      this.instructionsText.setVisible(false);
+      this.bottomLeftPanelBg.setVisible(false);
+    }
   }
 
   layoutHud(width, height) {
+    this.compactHud = this.isTouch || width < COMPACT_WIDTH_THRESHOLD;
+    const fontScale = this.compactHud ? 0.85 : 1;
+
+    this.topLeftPanelBg.setPosition(0, 0);
+    this.topLeftPanelBg.height = this.compactHud ? 96 : 146;
+    this.resourceText.setFontSize(Math.round(15 * fontScale));
+    this.nestText.setFontSize(Math.round(15 * fontScale));
+    this.nestText.setPosition(16, this.compactHud ? 48 : 96);
+
     this.topRightPanelBg.setPosition(width - 16, 6);
     this.tierText.setPosition(width - 16, 16);
+    this.tierText.setFontSize(Math.round(15 * fontScale));
+
     this.eggHpBarBg.setPosition(width / 2, 16);
     this.eggHpBarFill.setPosition(width / 2 - 120, 16);
     this.eggHpLabel.setPosition(width / 2, 16);
-    this.promptText.setPosition(width / 2, height - 90);
-    this.promptPanelBg.setPosition(width / 2, height - 90);
+
+    if (this.compactHud) {
+      this.promptText.setPosition(width / 2, 116);
+      this.promptPanelBg.setPosition(width / 2, 116);
+    } else {
+      this.promptText.setPosition(width / 2, height - 90);
+      this.promptPanelBg.setPosition(width / 2, height - 90);
+    }
+
     this.bottomLeftPanelBg.setPosition(0, height - 28);
     this.instructionsText.setPosition(16, height - 28);
     this.messageText.setPosition(width / 2, height - 130);
     this.messagePanelBg.setPosition(width / 2, height - 130);
+
+    const modalWidth = Math.min(560, width * 0.92);
+    const modalHeight = Math.min(460, height * 0.85);
     this.centerPanelBg.setPosition(width / 2, height / 2);
-    this.centerPortrait.setPosition(width / 2, height / 2 - 110);
-    this.centerTitle.setPosition(width / 2, height / 2 + 60);
-    this.centerBody.setPosition(width / 2, height / 2 + 140);
+    this.centerPanelBg.width = modalWidth;
+    this.centerPanelBg.height = modalHeight;
+    this.centerPortrait.setPosition(width / 2, height / 2 - modalHeight * 0.24);
+    this.centerTitle.setPosition(width / 2, height / 2 + modalHeight * 0.13);
+    this.centerTitle.setFontSize(Math.round(30 * Math.min(1, modalWidth / 560)));
+    this.centerBody.setPosition(width / 2, height / 2 + modalHeight * 0.3);
+
+    this.layoutTouchControls(width, height);
+    this.layoutOrientationOverlay(width, height);
   }
 
   // ---------- input ----------
@@ -276,26 +336,21 @@ export default class GameScene extends Phaser.Scene {
       right2: 'RIGHT',
     });
 
-    this.input.keyboard.on('keydown-E', () => this.handleInteract());
-    this.input.keyboard.on('keydown-Q', () => this.handleEggAction());
-    this.input.keyboard.on('keydown-SPACE', () => this.handleAttack());
+    this.input.keyboard.on('keydown-E', () => {
+      this.inputState.interact = true;
+    });
+    this.input.keyboard.on('keydown-Q', () => {
+      this.inputState.eggAction = true;
+    });
+    this.input.keyboard.on('keydown-SPACE', () => {
+      this.inputState.attack = true;
+    });
     this.input.keyboard.on('keydown-R', () => {
       if (this.gameOver || this.gameWon) this.scene.restart();
     });
   }
 
-  // ---------- update ----------
-
-  update(time, delta) {
-    if (this.gameOver || this.gameWon) return;
-
-    this.updatePlayerMovement(delta);
-    this.updateRaiders(time, delta);
-    this.updateNodesVisuals();
-    this.updateHud(time);
-  }
-
-  updatePlayerMovement(delta) {
+  pollKeyboardMovement() {
     let dx = 0;
     let dy = 0;
     if (this.keys.left.isDown || this.keys.left2.isDown) dx -= 1;
@@ -305,8 +360,241 @@ export default class GameScene extends Phaser.Scene {
 
     if (dx !== 0 || dy !== 0) {
       const len = Math.hypot(dx, dy);
-      dx /= len;
-      dy /= len;
+      this.inputState.moveX = dx / len;
+      this.inputState.moveY = dy / len;
+      this.keyboardMoving = true;
+    } else if (this.keyboardMoving) {
+      this.inputState.moveX = 0;
+      this.inputState.moveY = 0;
+      this.keyboardMoving = false;
+    }
+  }
+
+  consumeInputActions() {
+    if (this.inputState.interact) {
+      this.inputState.interact = false;
+      this.handleInteract();
+    }
+    if (this.inputState.eggAction) {
+      this.inputState.eggAction = false;
+      this.handleEggAction();
+    }
+    if (this.inputState.attack) {
+      this.inputState.attack = false;
+      this.handleAttack();
+    }
+  }
+
+  // ---------- touch controls ----------
+
+  probeSafeArea() {
+    if (typeof document === 'undefined') return { top: 0, right: 0, bottom: 0, left: 0 };
+    const div = document.createElement('div');
+    div.style.position = 'fixed';
+    div.style.top = '0';
+    div.style.left = '0';
+    div.style.width = '0';
+    div.style.height = '0';
+    div.style.paddingTop = 'env(safe-area-inset-top)';
+    div.style.paddingRight = 'env(safe-area-inset-right)';
+    div.style.paddingBottom = 'env(safe-area-inset-bottom)';
+    div.style.paddingLeft = 'env(safe-area-inset-left)';
+    document.body.appendChild(div);
+    const cs = getComputedStyle(div);
+    const insets = {
+      top: parseFloat(cs.paddingTop) || 0,
+      right: parseFloat(cs.paddingRight) || 0,
+      bottom: parseFloat(cs.paddingBottom) || 0,
+      left: parseFloat(cs.paddingLeft) || 0,
+    };
+    document.body.removeChild(div);
+    return insets;
+  }
+
+  buildTouchControls() {
+    if (!this.isTouch) return;
+
+    this.joystickActive = false;
+    this.joystickPointerId = null;
+    this.joystickOrigin = { x: 0, y: 0 };
+
+    this.joystickBase = this.add.circle(0, 0, JOYSTICK_RADIUS, 0xffffff, 0.15).setStrokeStyle(3, 0xffffff, 0.4).setScrollFactor(0).setDepth(1500);
+    this.joystickKnob = this.add.circle(0, 0, 24, 0xffffff, 0.35).setScrollFactor(0).setDepth(1501);
+    this.joystickZone = this.add
+      .circle(0, 0, JOYSTICK_HIT_RADIUS, 0xffffff, 0.001)
+      .setScrollFactor(0)
+      .setDepth(1502)
+      .setInteractive();
+
+    this.joystickZone.on('pointerdown', (pointer) => {
+      this.joystickActive = true;
+      this.joystickPointerId = pointer.id;
+      this.updateJoystickFromPointer(pointer);
+    });
+    this.input.on('pointermove', (pointer) => {
+      if (this.joystickActive && pointer.id === this.joystickPointerId) {
+        this.updateJoystickFromPointer(pointer);
+      }
+    });
+    this.input.on('pointerup', (pointer) => {
+      if (this.joystickActive && pointer.id === this.joystickPointerId) {
+        this.releaseJoystick();
+      }
+    });
+    this.input.on('pointerupoutside', (pointer) => {
+      if (this.joystickActive && pointer.id === this.joystickPointerId) {
+        this.releaseJoystick();
+      }
+    });
+
+    const makeButton = (radius, color) =>
+      this.add.circle(0, 0, radius, color, 0.35).setStrokeStyle(3, 0xffffff, 0.55).setScrollFactor(0).setDepth(1500).setInteractive();
+    const labelStyle = { fontFamily: 'monospace', fontSize: '12px', color: '#111827', fontStyle: 'bold' };
+    const makeLabel = (text) => this.add.text(0, 0, text, labelStyle).setOrigin(0.5).setScrollFactor(0).setDepth(1501);
+
+    this.attackButton = makeButton(38, 0xfef08a);
+    this.attackLabel = makeLabel('ATK');
+    this.eggButton = makeButton(32, 0x60a5fa);
+    this.eggLabel = makeLabel('EGG');
+    this.interactButton = makeButton(32, 0x4ade80);
+    this.interactLabel = makeLabel('USE');
+
+    this.attackButton.on('pointerdown', () => {
+      this.inputState.attack = true;
+    });
+    this.eggButton.on('pointerdown', () => {
+      this.inputState.eggAction = true;
+    });
+    this.interactButton.on('pointerdown', () => {
+      this.inputState.interact = true;
+    });
+  }
+
+  updateJoystickFromPointer(pointer) {
+    const origin = this.joystickOrigin;
+    const dx = pointer.x - origin.x;
+    const dy = pointer.y - origin.y;
+    const dist = Math.hypot(dx, dy);
+
+    if (dist < JOYSTICK_DEAD_ZONE) {
+      this.inputState.moveX = 0;
+      this.inputState.moveY = 0;
+      this.joystickKnob.setPosition(origin.x, origin.y);
+      return;
+    }
+
+    const angle = Math.atan2(dy, dx);
+    const nx = Math.cos(angle);
+    const ny = Math.sin(angle);
+    const clamped = Math.min(dist, JOYSTICK_RADIUS);
+
+    this.inputState.moveX = nx;
+    this.inputState.moveY = ny;
+    this.joystickKnob.setPosition(origin.x + nx * clamped, origin.y + ny * clamped);
+  }
+
+  releaseJoystick() {
+    this.joystickActive = false;
+    this.joystickPointerId = null;
+    this.inputState.moveX = 0;
+    this.inputState.moveY = 0;
+    if (this.joystickKnob) this.joystickKnob.setPosition(this.joystickOrigin.x, this.joystickOrigin.y);
+  }
+
+  layoutTouchControls(width, height) {
+    if (!this.isTouch) return;
+    const sa = this.safeArea;
+
+    const joyX = 90 + sa.left;
+    const joyY = height - 110 - sa.bottom;
+    this.joystickOrigin = { x: joyX, y: joyY };
+    this.joystickBase.setPosition(joyX, joyY);
+    this.joystickZone.setPosition(joyX, joyY);
+    if (!this.joystickActive) this.joystickKnob.setPosition(joyX, joyY);
+
+    const btnX = width - 60 - sa.right;
+    const topSafeY = 70;
+    const attackY = height - 90 - sa.bottom;
+    const gap = Math.min(80, Math.max(50, (attackY - topSafeY) / 2));
+    const eggY = attackY - gap;
+    const interactY = eggY - gap;
+
+    this.attackButton.setPosition(btnX, attackY);
+    this.attackLabel.setPosition(btnX, attackY);
+    this.eggButton.setPosition(btnX, eggY);
+    this.eggLabel.setPosition(btnX, eggY);
+    this.interactButton.setPosition(btnX, interactY);
+    this.interactLabel.setPosition(btnX, interactY);
+  }
+
+  updateTouchControls() {
+    if (!this.isTouch) return;
+
+    const node = this.nearestHarvestableNode();
+    const nearNest = this.nearNestSite();
+    const nextLevelConfig = BALANCE.nestLevels[this.nestLevel + 1];
+    const interactUsable = !!node || (nearNest && !!nextLevelConfig && this.totalRocks() >= 0);
+    this.setButtonEnabled(this.interactButton, this.interactLabel, interactUsable);
+
+    const eggUsable = this.carrying
+      ? this.nearVolcano() || (this.nestLevel >= 1 && nearNest)
+      : this.nestLevel >= 1 && nearNest;
+    this.setButtonEnabled(this.eggButton, this.eggLabel, eggUsable);
+  }
+
+  setButtonEnabled(button, label, enabled) {
+    button.setAlpha(enabled ? 0.85 : 0.35);
+    label.setAlpha(enabled ? 1 : 0.5);
+  }
+
+  // ---------- orientation ----------
+
+  buildOrientationOverlay() {
+    this.orientationOverlay = this.add.rectangle(0, 0, 10, 10, 0x000000, 0.94).setOrigin(0, 0).setScrollFactor(0).setDepth(3000).setVisible(false);
+    this.orientationText = this.add
+      .text(0, 0, 'Rotate your device to landscape\nto play', {
+        fontFamily: 'monospace',
+        fontSize: '20px',
+        color: '#fef3c7',
+        align: 'center',
+      })
+      .setOrigin(0.5)
+      .setScrollFactor(0)
+      .setDepth(3001)
+      .setVisible(false);
+
+    this.checkOrientation = () => {
+      const portrait = typeof window !== 'undefined' && window.matchMedia('(orientation: portrait)').matches;
+      this.orientationBlocked = this.isTouch && portrait;
+      this.orientationOverlay.setVisible(this.orientationBlocked);
+      this.orientationText.setVisible(this.orientationBlocked);
+    };
+  }
+
+  layoutOrientationOverlay(width, height) {
+    this.orientationOverlay.setSize(width, height);
+    this.orientationText.setPosition(width / 2, height / 2);
+  }
+
+  // ---------- update ----------
+
+  update(time, delta) {
+    if (this.gameOver || this.gameWon || this.orientationBlocked) return;
+
+    this.pollKeyboardMovement();
+    this.consumeInputActions();
+    this.updatePlayerMovement(delta);
+    this.updateRaiders(time, delta);
+    this.updateNodesVisuals();
+    this.updateTouchControls();
+    this.updateHud(time);
+  }
+
+  updatePlayerMovement(delta) {
+    const dx = this.inputState.moveX;
+    const dy = this.inputState.moveY;
+
+    if (dx !== 0 || dy !== 0) {
       const speed = BALANCE.playerSpeed * (this.carrying ? BALANCE.carrySpeedMultiplier : 1);
       const dist = (speed * delta) / 1000;
       this.playerContainer.x = Phaser.Math.Clamp(this.playerContainer.x + dx * dist, 20, WORLD.width - 20);
@@ -627,13 +915,17 @@ export default class GameScene extends Phaser.Scene {
   // ---------- HUD update ----------
 
   updateHud(time) {
-    this.resourceText.setText(
-      [
-        `Ember: ${this.inventory.ember}  (total ${this.totalCollected.ember})`,
-        `Frost: ${this.inventory.frost}  (total ${this.totalCollected.frost})`,
-        `Storm: ${this.inventory.storm}  (total ${this.totalCollected.storm})`,
-      ].join('\n')
-    );
+    if (this.compactHud) {
+      this.resourceText.setText(`\u{1F525}${this.inventory.ember}  ❄${this.inventory.frost}  ⚡${this.inventory.storm}`);
+    } else {
+      this.resourceText.setText(
+        [
+          `Ember: ${this.inventory.ember}  (total ${this.totalCollected.ember})`,
+          `Frost: ${this.inventory.frost}  (total ${this.totalCollected.frost})`,
+          `Storm: ${this.inventory.storm}  (total ${this.totalCollected.storm})`,
+        ].join('\n')
+      );
+    }
 
     const nestLabel = this.nestLevel === 0 ? 'not built' : `level ${this.nestLevel}`;
     this.nestText.setText(`Nest: ${nestLabel}\nEgg status: ${this.carrying ? 'carried' : 'in nest'}`);
@@ -651,15 +943,23 @@ export default class GameScene extends Phaser.Scene {
       this.eggNestHpBarFill.setFillStyle(ratio > 0.5 ? 0x4ade80 : ratio > 0.25 ? 0xfacc15 : 0xef4444);
     }
 
-    this.promptText.setText(this.computePrompt());
-    this.fitPanelToText(this.promptPanelBg, this.promptText, 24, 14);
-
-    if (time < this.transientMessageUntil) {
-      this.messageText.setText(this.transientMessage);
-    } else {
+    if (this.compactHud) {
+      const activeText = time < this.transientMessageUntil ? this.transientMessage : this.computePrompt();
+      this.promptText.setText(activeText);
+      this.fitPanelToText(this.promptPanelBg, this.promptText, 24, 14);
       this.messageText.setText('');
+      this.messagePanelBg.setVisible(false);
+    } else {
+      this.promptText.setText(this.computePrompt());
+      this.fitPanelToText(this.promptPanelBg, this.promptText, 24, 14);
+
+      if (time < this.transientMessageUntil) {
+        this.messageText.setText(this.transientMessage);
+      } else {
+        this.messageText.setText('');
+      }
+      this.fitPanelToText(this.messagePanelBg, this.messageText, 24, 12);
     }
-    this.fitPanelToText(this.messagePanelBg, this.messageText, 24, 12);
   }
 
   fitPanelToText(panel, text, paddingX, paddingY) {
