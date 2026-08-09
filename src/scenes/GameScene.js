@@ -59,7 +59,6 @@ export default class GameScene extends Phaser.Scene {
     this.inputState = { moveX: 0, moveY: 0, interact: false, eggAction: false, attack: false };
     this.keyboardMoving = false;
     this.isTouch = this.sys.game.device.input.touch;
-    this.orientationBlocked = false;
     this.compactHud = false;
     this.safeArea = this.probeSafeArea();
 
@@ -72,7 +71,6 @@ export default class GameScene extends Phaser.Scene {
     this.buildHud();
     this.buildInput();
     this.buildTouchControls();
-    this.buildOrientationOverlay();
 
     this.cameras.main.setBounds(0, 0, WORLD.width, WORLD.height);
     this.cameras.main.startFollow(this.playerContainer, true, 0.09, 0.09);
@@ -80,13 +78,14 @@ export default class GameScene extends Phaser.Scene {
     this.scale.on('resize', (gameSize) => {
       this.cameras.main.setViewport(0, 0, gameSize.width, gameSize.height);
       this.safeArea = this.probeSafeArea();
-      this.checkOrientation();
       this.layoutHud(gameSize.width, gameSize.height);
     });
 
     // Some mobile browsers report a stale viewport size to ResizeObserver right
     // after rotation; force Phaser to recompute so the 'resize' handler above
-    // always fires with correct dimensions.
+    // always fires with correct dimensions. The layout itself is orientation-
+    // independent (see layoutHud/layoutTouchControls), so there's no lock to
+    // apply here — this only fixes the canvas staying the wrong size.
     const forceRescale = () => this.scale.refresh();
     window.addEventListener('resize', forceRescale);
     window.addEventListener('orientationchange', forceRescale);
@@ -95,7 +94,6 @@ export default class GameScene extends Phaser.Scene {
       window.removeEventListener('orientationchange', forceRescale);
     });
 
-    this.checkOrientation();
     this.layoutHud(this.scale.width, this.scale.height);
 
     this.scheduleTierIncrease();
@@ -279,25 +277,38 @@ export default class GameScene extends Phaser.Scene {
 
   layoutHud(width, height) {
     this.compactHud = this.isTouch || width < COMPACT_WIDTH_THRESHOLD;
+    const narrow = width < 500;
     const fontScale = this.compactHud ? 0.85 : 1;
 
+    const topLeftWidth = narrow ? 150 : 250;
+    const topRightWidth = narrow ? 140 : 170;
+
     this.topLeftPanelBg.setPosition(0, 0);
+    this.topLeftPanelBg.width = topLeftWidth;
     this.topLeftPanelBg.height = this.compactHud ? 96 : 146;
     this.resourceText.setFontSize(Math.round(15 * fontScale));
     this.nestText.setFontSize(Math.round(15 * fontScale));
     this.nestText.setPosition(16, this.compactHud ? 48 : 96);
 
+    this.topRightPanelBg.width = topRightWidth;
     this.topRightPanelBg.setPosition(width - 16, 6);
     this.tierText.setPosition(width - 16, 16);
     this.tierText.setFontSize(Math.round(15 * fontScale));
 
-    this.eggHpBarBg.setPosition(width / 2, 16);
-    this.eggHpBarFill.setPosition(width / 2 - 120, 16);
-    this.eggHpLabel.setPosition(width / 2, 16);
+    // On narrow screens the corner panels are too wide to share a row with a
+    // centered fixed-width egg bar, so shrink it and stack it in its own row
+    // below the top panels, with the prompt line in a further row below that.
+    this.eggHpBarMaxWidth = narrow ? Math.min(200, width - 40) : 240;
+    const eggBarY = narrow ? 118 : 16;
+    this.eggHpBarBg.width = this.eggHpBarMaxWidth;
+    this.eggHpBarBg.setPosition(width / 2, eggBarY);
+    this.eggHpBarFill.setPosition(width / 2 - this.eggHpBarMaxWidth / 2, eggBarY);
+    this.eggHpLabel.setPosition(width / 2, eggBarY);
 
     if (this.compactHud) {
-      this.promptText.setPosition(width / 2, 116);
-      this.promptPanelBg.setPosition(width / 2, 116);
+      const promptY = narrow ? 158 : 116;
+      this.promptText.setPosition(width / 2, promptY);
+      this.promptPanelBg.setPosition(width / 2, promptY);
     } else {
       this.promptText.setPosition(width / 2, height - 90);
       this.promptPanelBg.setPosition(width / 2, height - 90);
@@ -319,7 +330,6 @@ export default class GameScene extends Phaser.Scene {
     this.centerBody.setPosition(width / 2, height / 2 + modalHeight * 0.3);
 
     this.layoutTouchControls(width, height);
-    this.layoutOrientationOverlay(width, height);
   }
 
   // ---------- input ----------
@@ -547,39 +557,10 @@ export default class GameScene extends Phaser.Scene {
     label.setAlpha(enabled ? 1 : 0.5);
   }
 
-  // ---------- orientation ----------
-
-  buildOrientationOverlay() {
-    this.orientationOverlay = this.add.rectangle(0, 0, 10, 10, 0x000000, 0.94).setOrigin(0, 0).setScrollFactor(0).setDepth(3000).setVisible(false);
-    this.orientationText = this.add
-      .text(0, 0, 'Rotate your device to landscape\nto play', {
-        fontFamily: 'monospace',
-        fontSize: '20px',
-        color: '#fef3c7',
-        align: 'center',
-      })
-      .setOrigin(0.5)
-      .setScrollFactor(0)
-      .setDepth(3001)
-      .setVisible(false);
-
-    this.checkOrientation = () => {
-      const portrait = typeof window !== 'undefined' && window.matchMedia('(orientation: portrait)').matches;
-      this.orientationBlocked = this.isTouch && portrait;
-      this.orientationOverlay.setVisible(this.orientationBlocked);
-      this.orientationText.setVisible(this.orientationBlocked);
-    };
-  }
-
-  layoutOrientationOverlay(width, height) {
-    this.orientationOverlay.setSize(width, height);
-    this.orientationText.setPosition(width / 2, height / 2);
-  }
-
   // ---------- update ----------
 
   update(time, delta) {
-    if (this.gameOver || this.gameWon || this.orientationBlocked) return;
+    if (this.gameOver || this.gameWon) return;
 
     this.pollKeyboardMovement();
     this.consumeInputActions();
@@ -933,7 +914,7 @@ export default class GameScene extends Phaser.Scene {
     this.tierText.setText(`Raid tier: ${this.difficultyTier + 1}\nDefeated: ${this.raidersDefeated}`);
 
     const hpRatio = Phaser.Math.Clamp(this.eggHp / this.eggMaxHp, 0, 1);
-    this.eggHpBarFill.width = 240 * hpRatio;
+    this.eggHpBarFill.width = this.eggHpBarMaxWidth * hpRatio;
     this.eggHpBarFill.setFillStyle(hpRatio > 0.5 ? 0x4ade80 : hpRatio > 0.25 ? 0xfacc15 : 0xef4444);
     this.eggHpLabel.setText(`Egg HP ${Math.ceil(this.eggHp)}/${this.eggMaxHp}`);
 
