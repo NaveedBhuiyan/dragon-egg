@@ -1,0 +1,11 @@
+name = "nestward"
+main = "worker/index.js"
+compatibility_date = "2026-08-08"
+
+[[durable_objects.bindings]]
+name = "NESTWARD_ROOM"
+class_name = "NestwardRoom"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["NestwardRoom"]

@@ -12,6 +12,13 @@ dist
 dist-ssr
 *.local
 
+# Local dev-server state for the multiplayer server tooling
+.partykit
+.wrangler
+
+# Claude Code local settings
+.claude
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

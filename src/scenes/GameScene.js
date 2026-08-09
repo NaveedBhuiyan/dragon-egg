@@ -10,6 +10,7 @@ import {
   DRAGON_TINTS,
   SPRITE_SCALE,
 } from '../gameConfig.js';
+import { sendMessage } from '../net/client.js';
 
 const ROCK_ORDER = Object.keys(ROCK_TYPES);
 
@@ -40,16 +41,22 @@ export default class GameScene extends Phaser.Scene {
   }
 
   create(data) {
-    this.mode = data?.mode === 'guardianRaider' ? 'guardianRaider' : 'solo';
+    this.mode = data?.mode === 'guardianRaider' ? 'guardianRaider' : data?.mode === 'online' ? 'online' : 'solo';
+    this.onlineRole = data?.role ?? null;
+    this.socket = data?.socket ?? null;
+    this.peerConnected = this.mode !== 'online';
+    this.lastPosSentAt = 0;
 
-    this.inventory = { ember: 0, frost: 0, storm: 0 };
-    this.totalCollected = { ember: 0, frost: 0, storm: 0 };
-    this.nestLevel = 0;
-    this.carrying = true;
-    this.eggMaxHp = BALANCE.nestLevels[0].maxHp;
-    this.eggHp = this.eggMaxHp;
+    const initial = data?.initialState ?? null;
+
+    this.inventory = initial ? { ...initial.inventory } : { ember: 0, frost: 0, storm: 0 };
+    this.totalCollected = initial ? { ...initial.totalCollected } : { ember: 0, frost: 0, storm: 0 };
+    this.nestLevel = initial ? initial.nestLevel : 0;
+    this.carrying = initial ? initial.carrying : true;
+    this.eggMaxHp = initial ? initial.eggMaxHp : BALANCE.nestLevels[0].maxHp;
+    this.eggHp = initial ? initial.eggHp : this.eggMaxHp;
     this.difficultyTier = 0;
-    this.raidersDefeated = 0;
+    this.raidersDefeated = initial ? initial.raidersDefeated : 0;
     this.gameOver = false;
     this.gameWon = false;
     this.lastAttackTime = -Infinity;
@@ -61,6 +68,13 @@ export default class GameScene extends Phaser.Scene {
 
     this.inputState = { moveX: 0, moveY: 0, interact: false, eggAction: false, attack: false };
     this.raiderInputState = { moveX: 0, moveY: 0, attack: false };
+    // In online mode only one role is ever local, and keyboard/touch input
+    // always writes into `inputState` — alias it to `raiderInputState` when
+    // the Raider is local so the existing movement/touch code drives it
+    // without needing a parallel input path.
+    if (this.mode === 'online' && this.onlineRole === 'raider') {
+      this.raiderInputState = this.inputState;
+    }
     this.keyboardMoving = false;
     this.raiderKeyboardMoving = false;
     this.isTouch = this.sys.game.device.input.touch;
@@ -71,14 +85,21 @@ export default class GameScene extends Phaser.Scene {
     this.buildWorld();
     this.buildNestVisuals();
     this.buildVolcanoVisuals();
-    this.buildNodes();
+    this.buildNodes(initial?.nodes);
     this.buildPlayer();
     this.buildHud();
     this.buildInput();
     this.buildTouchControls();
 
     this.cameras.main.setBounds(0, 0, WORLD.width, WORLD.height);
-    this.cameras.main.startFollow(this.playerContainer, true, 0.09, 0.09);
+
+    if (this.mode === 'guardianRaider' || this.mode === 'online') {
+      this.spawnHumanRaider(initial);
+    }
+
+    const followTarget = this.mode === 'online' && this.onlineRole === 'raider' ? this.humanRaider.container : this.playerContainer;
+    this.cameras.main.startFollow(followTarget, true, 0.09, 0.09);
+    this.refreshNestVisuals();
 
     this.scale.on('resize', (gameSize) => {
       this.cameras.main.setViewport(0, 0, gameSize.width, gameSize.height);
@@ -97,15 +118,17 @@ export default class GameScene extends Phaser.Scene {
     this.events.once('shutdown', () => {
       window.removeEventListener('resize', forceRescale);
       window.removeEventListener('orientationchange', forceRescale);
+      this.socket?.removeEventListener('message', this.onNetworkMessage);
+      this.socket?.removeEventListener('close', this.onNetworkClose);
     });
 
     this.layoutHud(this.scale.width, this.scale.height);
 
-    if (this.mode === 'guardianRaider') {
-      this.spawnHumanRaider();
-    } else {
+    if (this.mode === 'solo') {
       this.scheduleTierIncrease();
       this.scheduleNextSpawn();
+    } else if (this.mode === 'online') {
+      this.setupNetwork();
     }
   }
 
@@ -183,19 +206,20 @@ export default class GameScene extends Phaser.Scene {
       .setOrigin(0.5);
   }
 
-  buildNodes() {
-    this.nodes = ROCK_NODES.map((cfg) => {
+  buildNodes(initialNodes) {
+    this.nodes = ROCK_NODES.map((cfg, id) => {
       const type = ROCK_TYPES[cfg.type];
+      const reserve = initialNodes ? initialNodes.find((n) => n.id === id)?.reserve ?? BALANCE.nodeReserve : BALANCE.nodeReserve;
       const circle = this.add.circle(cfg.x, cfg.y, 16, type.color);
       circle.setStrokeStyle(2, 0xffffff, 0.4);
       const text = this.add
-        .text(cfg.x, cfg.y + 26, `${BALANCE.nodeReserve}`, {
+        .text(cfg.x, cfg.y + 26, `${reserve}`, {
           fontFamily: 'monospace',
           fontSize: '13px',
           color: '#e5e7eb',
         })
         .setOrigin(0.5);
-      return { cfg, reserve: BALANCE.nodeReserve, circle, text };
+      return { id, cfg, reserve, circle, text };
     });
   }
 
@@ -241,9 +265,13 @@ export default class GameScene extends Phaser.Scene {
       .setScrollFactor(0)
       .setOrigin(0.5);
 
+    const isRaider = this.mode === 'online' && this.onlineRole === 'raider';
+    const instructions = isRaider
+      ? 'Move: WASD/Arrows   Attack: SPACE — get close to the egg and strike!'
+      : 'Move: WASD/Arrows   Attack: SPACE   Interact/Build: E   Egg: Q';
     this.bottomLeftPanelBg = this.add.rectangle(0, 0, 560, 30, panelColor, panelAlpha).setOrigin(0, 0.5).setDepth(999).setScrollFactor(0);
     this.instructionsText = this.add
-      .text(16, 0, 'Move: WASD/Arrows   Attack: SPACE   Interact/Build: E   Egg: Q', {
+      .text(16, 0, instructions, {
         fontFamily: 'monospace',
         fontSize: '13px',
         color: '#9ca3af',
@@ -259,7 +287,14 @@ export default class GameScene extends Phaser.Scene {
       .setScrollFactor(0)
       .setOrigin(0.5);
 
-    this.centerPanelBg = this.add.rectangle(0, 0, 560, 460, 0x000000, 0.75).setDepth(2000).setScrollFactor(0).setVisible(false);
+    this.centerPanelBg = this.add
+      .rectangle(0, 0, 560, 460, 0x000000, 0.75)
+      .setDepth(2000)
+      .setScrollFactor(0)
+      .setVisible(false)
+      .setInteractive();
+    // Tap-to-restart for touch devices, which have no keyboard for the R key.
+    this.centerPanelBg.on('pointerdown', () => this.restartOrExit());
     this.centerPortrait = this.add
       .sprite(0, 0, 'dragon_front_01')
       .setDepth(2001)
@@ -367,9 +402,17 @@ export default class GameScene extends Phaser.Scene {
     this.input.keyboard.on('keydown-ENTER', () => {
       if (this.mode === 'guardianRaider') this.raiderInputState.attack = true;
     });
-    this.input.keyboard.on('keydown-R', () => {
-      if (this.gameOver || this.gameWon) this.scene.restart({ mode: this.mode });
-    });
+    this.input.keyboard.on('keydown-R', () => this.restartOrExit());
+  }
+
+  restartOrExit() {
+    if (!this.gameOver && !this.gameWon) return;
+    if (this.mode === 'online') {
+      this.socket?.close();
+      this.scene.start('ModeSelectScene');
+    } else {
+      this.scene.restart({ mode: this.mode });
+    }
   }
 
   pollKeyboardMovement() {
@@ -417,6 +460,27 @@ export default class GameScene extends Phaser.Scene {
   }
 
   consumeInputActions() {
+    if (this.mode === 'online') {
+      if (this.onlineRole === 'guardian') {
+        if (this.inputState.interact) {
+          this.inputState.interact = false;
+          this.sendGuardianInteract();
+        }
+        if (this.inputState.eggAction) {
+          this.inputState.eggAction = false;
+          this.sendGuardianEggAction();
+        }
+        if (this.inputState.attack) {
+          this.inputState.attack = false;
+          this.sendGuardianAttack();
+        }
+      } else if (this.onlineRole === 'raider' && this.inputState.attack) {
+        this.inputState.attack = false;
+        this.sendRaiderAttack();
+      }
+      return;
+    }
+
     if (this.inputState.interact) {
       this.inputState.interact = false;
       this.handleInteract();
@@ -433,6 +497,226 @@ export default class GameScene extends Phaser.Scene {
       this.raiderInputState.attack = false;
       this.handleRaiderAttack();
     }
+  }
+
+  // ---------- online networking ----------
+  //
+  // Movement is client-authoritative and simply relayed: each device sends
+  // its own local role's position on a short interval, and applies whatever
+  // it receives for the other role directly (no interpolation/prediction —
+  // acceptable for a casual 2-friend game). Every other action (harvesting,
+  // building, attacking, the egg, win/lose) is sent to the server instead of
+  // applied locally, and the resulting authoritative state comes back via
+  // 'stateUpdate' broadcasts to both clients — including the sender, so
+  // there's no separate "local prediction" path to keep in sync.
+
+  setupNetwork() {
+    this.onNetworkMessage = (event) => {
+      let msg;
+      try {
+        msg = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+      this.handleNetworkMessage(msg);
+    };
+    this.onNetworkClose = () => {
+      this.peerConnected = false;
+      if (!this.gameOver && !this.gameWon) {
+        this.showMessage('Connection lost — trying to reconnect...');
+      }
+    };
+    this.socket.addEventListener('message', this.onNetworkMessage);
+    this.socket.addEventListener('close', this.onNetworkClose);
+  }
+
+  handleNetworkMessage(msg) {
+    if (msg.type === 'pos') {
+      this.applyRemotePos(msg);
+    } else if (msg.type === 'stateUpdate') {
+      this.applyServerState(msg.state);
+    } else if (msg.type === 'peerJoined') {
+      this.peerConnected = true;
+      this.showMessage("Your friend joined!");
+    } else if (msg.type === 'peerLeft') {
+      this.peerConnected = false;
+      this.showMessage('Your friend disconnected.');
+    }
+  }
+
+  applyRemotePos(msg) {
+    const remoteRole = this.onlineRole === 'guardian' ? 'raider' : 'guardian';
+    if (msg.role !== remoteRole) return;
+
+    if (remoteRole === 'guardian') {
+      this.playerContainer.setPosition(msg.x, msg.y);
+      this.playerFacing = msg.facing;
+      this.playerBody.setFlipX(msg.facing < 0);
+      this.playerBody.play(msg.moving ? 'dragon-walk' : 'dragon-idle', true);
+    } else if (this.humanRaider) {
+      this.humanRaider.container.setPosition(msg.x, msg.y);
+      this.humanRaider.facing = msg.facing;
+      this.humanRaider.body.setFlipX(msg.facing < 0);
+      this.humanRaider.body.play(msg.moving ? 'dragon-walk' : 'dragon-idle', true);
+    }
+  }
+
+  applyServerState(state) {
+    this.inventory = state.inventory;
+    this.totalCollected = state.totalCollected;
+    this.nestLevel = state.nestLevel;
+    this.eggMaxHp = state.eggMaxHp;
+    this.eggHp = state.eggHp;
+    this.carrying = state.carrying;
+    this.raidersDefeated = state.raidersDefeated;
+    this.playerEgg.setVisible(this.carrying);
+
+    for (const nodeState of state.nodes) {
+      const node = this.nodes.find((n) => n.id === nodeState.id);
+      if (node) node.reserve = nodeState.reserve;
+    }
+
+    if (this.humanRaider) {
+      const wasDead = this.humanRaider.dead;
+      this.humanRaider.hp = state.raiderHp;
+      this.humanRaider.maxHp = state.raiderMaxHp;
+      this.humanRaider.dead = state.raiderDead;
+      this.humanRaider.container.setVisible(!state.raiderDead);
+
+      if (wasDead && !state.raiderDead && this.onlineRole === 'raider') {
+        const { x, y } = this.randomEdgePoint();
+        this.humanRaider.container.setPosition(x, y);
+      }
+    }
+
+    this.refreshNestVisuals();
+
+    if ((state.gameWon || state.gameOver) && !this.gameWon && !this.gameOver) {
+      this.gameWon = state.gameWon;
+      this.gameOver = state.gameOver;
+      if (this.spawnTimer) this.spawnTimer.remove(false);
+      this.showOnlineEndScreen(state, state.winnerRole === this.onlineRole);
+    }
+  }
+
+  updatePosBroadcast(time) {
+    if (time - this.lastPosSentAt < 80) return;
+    this.lastPosSentAt = time;
+
+    if (this.onlineRole === 'guardian') {
+      sendMessage(this.socket, {
+        type: 'pos',
+        x: this.playerContainer.x,
+        y: this.playerContainer.y,
+        facing: this.playerFacing,
+        moving: this.inputState.moveX !== 0 || this.inputState.moveY !== 0,
+      });
+    } else if (this.onlineRole === 'raider' && this.humanRaider) {
+      sendMessage(this.socket, {
+        type: 'pos',
+        x: this.humanRaider.container.x,
+        y: this.humanRaider.container.y,
+        facing: this.humanRaider.facing,
+        moving: this.raiderInputState.moveX !== 0 || this.raiderInputState.moveY !== 0,
+      });
+    }
+  }
+
+  sendGuardianInteract() {
+    const node = this.nearestHarvestableNode();
+    const x = this.playerContainer.x;
+    const y = this.playerContainer.y;
+    if (node) {
+      sendMessage(this.socket, { type: 'action', kind: 'harvest', nodeId: node.id, x, y });
+      return;
+    }
+    if (this.nearNestSite()) {
+      sendMessage(this.socket, { type: 'action', kind: 'build', x, y });
+    }
+  }
+
+  sendGuardianEggAction() {
+    const x = this.playerContainer.x;
+    const y = this.playerContainer.y;
+    if (this.carrying) {
+      if (this.nearVolcano()) {
+        sendMessage(this.socket, { type: 'action', kind: 'eggDrop', x, y });
+      } else if (this.nestLevel >= 1 && this.nearNestSite()) {
+        sendMessage(this.socket, { type: 'action', kind: 'eggPlace', x, y });
+      }
+      return;
+    }
+    if (this.nestLevel >= 1 && this.nearNestSite()) {
+      sendMessage(this.socket, { type: 'action', kind: 'eggPickup', x, y });
+    }
+  }
+
+  sendGuardianAttack() {
+    if (this.time.now - this.lastAttackTime < BALANCE.attack.cooldownMs) return;
+    this.lastAttackTime = this.time.now;
+    this.showAttackSwing(this.playerContainer.x, this.playerContainer.y, 0xfef08a);
+    if (!this.humanRaider) return;
+
+    sendMessage(this.socket, {
+      type: 'action',
+      kind: 'guardianAttack',
+      guardianX: this.playerContainer.x,
+      guardianY: this.playerContainer.y,
+      raiderX: this.humanRaider.container.x,
+      raiderY: this.humanRaider.container.y,
+    });
+  }
+
+  sendRaiderAttack() {
+    const raider = this.humanRaider;
+    if (!raider || raider.dead) return;
+    if (this.time.now - raider.lastAttackTime < BALANCE.attack.cooldownMs) return;
+    raider.lastAttackTime = this.time.now;
+    this.showAttackSwing(raider.container.x, raider.container.y, 0xef4444);
+
+    sendMessage(this.socket, {
+      type: 'action',
+      kind: 'raiderAttack',
+      raiderX: raider.container.x,
+      raiderY: raider.container.y,
+      guardianX: this.playerContainer.x,
+      guardianY: this.playerContainer.y,
+    });
+  }
+
+  showOnlineEndScreen(state, iWon) {
+    this.centerPanelBg.setVisible(true);
+
+    if (state.gameWon) {
+      const dragon = state.dragon;
+      this.centerPortrait.setTexture('egg_hatch_01').setScale(2.4).clearTint().setVisible(true);
+      this.centerPortrait.play('egg-hatch');
+      this.centerPortrait.once('animationcomplete', () => {
+        this.centerPortrait.setTexture('dragon_front_01').setScale(SPRITE_SCALE.portrait);
+        const tint = DRAGON_TINTS[dragon];
+        if (tint !== undefined) {
+          this.centerPortrait.setTint(tint);
+        } else {
+          this.startPrismaticShimmer();
+        }
+        this.centerPortrait.play('dragon-idle');
+      });
+      this.centerTitle.setText(iWon ? `Your ${dragon} hatched!` : `The Guardian's ${dragon} hatched...`).setVisible(true);
+    } else {
+      this.centerPortrait.setTexture('egg_idle_01').setScale(2.2).setTint(0x4b5563).stop().setVisible(true);
+      this.centerTitle.setText(iWon ? 'You destroyed the egg!' : 'Your egg was destroyed...').setVisible(true);
+    }
+
+    this.centerBody
+      .setText(
+        [
+          `Ember ${state.totalCollected.ember}  Frost ${state.totalCollected.frost}  Storm ${state.totalCollected.storm}`,
+          `Time: ${this.elapsedSeconds()}s  |  Raiders defeated: ${state.raidersDefeated}`,
+          '',
+          'Press R to return to the menu',
+        ].join('\n')
+      )
+      .setVisible(true);
   }
 
   // ---------- touch controls ----------
@@ -604,13 +888,27 @@ export default class GameScene extends Phaser.Scene {
 
     this.pollKeyboardMovement();
     this.consumeInputActions();
-    this.updatePlayerMovement(delta);
 
-    if (this.mode === 'guardianRaider') {
+    if (this.mode === 'online') {
+      // Only the locally-controlled role simulates its own movement; the
+      // other role's container is positioned from network 'pos' messages
+      // in applyRemotePos(). Both still need their HP bar redrawn each
+      // frame since that's cosmetic, not authoritative state.
+      if (this.onlineRole === 'guardian') {
+        this.updatePlayerMovement(delta);
+      } else {
+        this.updateHumanRaider(delta);
+      }
+      this.updatePosBroadcast(time);
+    } else if (this.mode === 'guardianRaider') {
+      this.updatePlayerMovement(delta);
       this.updateHumanRaider(delta);
     } else {
+      this.updatePlayerMovement(delta);
       this.updateRaiders(time, delta);
     }
+
+    if (this.humanRaider) this.drawRaiderHpBar(this.humanRaider);
 
     this.updateNodesVisuals();
     this.updateTouchControls();
@@ -761,12 +1059,8 @@ export default class GameScene extends Phaser.Scene {
     }
   }
 
-  handleAttack() {
-    if (this.gameOver || this.gameWon) return;
-    if (this.time.now - this.lastAttackTime < BALANCE.attack.cooldownMs) return;
-    this.lastAttackTime = this.time.now;
-
-    const ring = this.add.circle(this.playerContainer.x, this.playerContainer.y, BALANCE.attack.range, 0xfef08a, 0.25);
+  showAttackSwing(x, y, color) {
+    const ring = this.add.circle(x, y, BALANCE.attack.range, color, 0.25);
     this.tweens.add({
       targets: ring,
       alpha: 0,
@@ -774,6 +1068,14 @@ export default class GameScene extends Phaser.Scene {
       duration: 220,
       onComplete: () => ring.destroy(),
     });
+  }
+
+  handleAttack() {
+    if (this.gameOver || this.gameWon) return;
+    if (this.time.now - this.lastAttackTime < BALANCE.attack.cooldownMs) return;
+    this.lastAttackTime = this.time.now;
+
+    this.showAttackSwing(this.playerContainer.x, this.playerContainer.y, 0xfef08a);
 
     for (const raider of this.raiders) {
       if (raider.dead) continue;
@@ -965,9 +1267,11 @@ export default class GameScene extends Phaser.Scene {
 
   // ---------- human-controlled raider (2-player mode) ----------
 
-  spawnHumanRaider() {
+  spawnHumanRaider(initial) {
     const { x, y } = this.randomEdgePoint();
-    const hp = BALANCE.raiderPvp.hp;
+    const hp = initial ? initial.raiderHp : BALANCE.raiderPvp.hp;
+    const maxHp = initial ? initial.raiderMaxHp : BALANCE.raiderPvp.hp;
+    const dead = initial ? initial.raiderDead : false;
 
     const body = this.add
       .sprite(0, 6, 'dragon_walk_01')
@@ -975,7 +1279,7 @@ export default class GameScene extends Phaser.Scene {
       .setOrigin(0.5, 0.75)
       .setTint(0xdc2626);
     body.play('dragon-idle');
-    const container = this.add.container(x, y, [body]);
+    const container = this.add.container(x, y, [body]).setVisible(!dead);
     const hpBarGfx = this.add.graphics();
 
     this.humanRaider = {
@@ -983,12 +1287,12 @@ export default class GameScene extends Phaser.Scene {
       body,
       hpBarGfx,
       hp,
-      maxHp: hp,
+      maxHp,
       speed: BALANCE.raiderPvp.speed,
       facing: 1,
       attackElapsed: 0,
       lastAttackTime: -Infinity,
-      dead: false,
+      dead,
       isHuman: true,
     };
     this.raiders.push(this.humanRaider);
@@ -1007,8 +1311,6 @@ export default class GameScene extends Phaser.Scene {
       delta,
       raider.facing
     );
-
-    this.drawRaiderHpBar(raider);
   }
 
   handleRaiderAttack() {
@@ -1017,14 +1319,7 @@ export default class GameScene extends Phaser.Scene {
     if (this.time.now - raider.lastAttackTime < BALANCE.attack.cooldownMs) return;
     raider.lastAttackTime = this.time.now;
 
-    const ring = this.add.circle(raider.container.x, raider.container.y, BALANCE.attack.range, 0xef4444, 0.25);
-    this.tweens.add({
-      targets: ring,
-      alpha: 0,
-      scale: 1.3,
-      duration: 220,
-      onComplete: () => ring.destroy(),
-    });
+    this.showAttackSwing(raider.container.x, raider.container.y, 0xef4444);
 
     const eggPos = this.eggWorldPosition();
     const d = Phaser.Math.Distance.Between(raider.container.x, raider.container.y, eggPos.x, eggPos.y);
@@ -1103,6 +1398,10 @@ export default class GameScene extends Phaser.Scene {
   }
 
   computePrompt() {
+    if (this.mode === 'online' && this.onlineRole === 'raider') {
+      return this.computeRaiderPrompt();
+    }
+
     const node = this.nearestHarvestableNode();
     if (node) {
       return `[E] Harvest ${ROCK_TYPES[node.cfg.type].label} (${node.reserve} left)`;
@@ -1123,6 +1422,13 @@ export default class GameScene extends Phaser.Scene {
     }
 
     return '';
+  }
+
+  computeRaiderPrompt() {
+    if (!this.humanRaider || this.humanRaider.dead) return 'Respawning...';
+    const eggPos = this.eggWorldPosition();
+    const d = Phaser.Math.Distance.Between(this.humanRaider.container.x, this.humanRaider.container.y, eggPos.x, eggPos.y);
+    return d <= BALANCE.attack.range ? '[SPACE] Attack the egg!' : '';
   }
 
   // ---------- end states ----------

@@ -1,0 +1,6 @@
+{
+  "$schema": "https://www.partykit.io/schema.json",
+  "name": "nestward",
+  "main": "party/index.js",
+  "compatibilityDate": "2026-08-09"
+}
