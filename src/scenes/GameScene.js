@@ -10,7 +10,6 @@ import {
   DRAGON_TINTS,
   SPRITE_SCALE,
 } from '../gameConfig.js';
-import backgroundUrl from '../assets/background.jpg';
 
 const ROCK_ORDER = Object.keys(ROCK_TYPES);
 
@@ -30,7 +29,6 @@ export default class GameScene extends Phaser.Scene {
   }
 
   preload() {
-    this.load.image('background', backgroundUrl);
     for (const [key, url] of Object.entries(SPRITES)) {
       this.load.image(key, url);
     }
@@ -92,9 +90,15 @@ export default class GameScene extends Phaser.Scene {
   // ---------- world ----------
 
   buildWorld() {
-    const bg = this.add.image(WORLD.width / 2, WORLD.height / 2, 'background');
-    const coverScale = Math.max(WORLD.width / bg.width, WORLD.height / bg.height);
-    bg.setDisplaySize(bg.width * coverScale, bg.height * coverScale);
+    this.add.rectangle(0, 0, WORLD.width, WORLD.height, 0x1f2b1a).setOrigin(0, 0);
+    const grid = this.add.graphics();
+    grid.lineStyle(1, 0xffffff, 0.05);
+    for (let x = 0; x <= WORLD.width; x += 100) {
+      grid.lineBetween(x, 0, x, WORLD.height);
+    }
+    for (let y = 0; y <= WORLD.height; y += 100) {
+      grid.lineBetween(0, y, WORLD.width, y);
+    }
   }
 
   buildNestVisuals() {
