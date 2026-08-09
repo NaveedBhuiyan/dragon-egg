@@ -82,4 +82,15 @@ export const BALANCE = {
     damage: 55,
     cooldownMs: 350,
   },
+
+  // Human-controlled Raider (2-player mode) — distinct from the AI raider
+  // tunables above since a player-controlled opponent needs different pacing:
+  // fast/tanky enough to be fun to play, damage low enough that egg fights
+  // aren't over in one or two hits.
+  raiderPvp: {
+    speed: 175,
+    hp: 80,
+    eggDamage: 10,
+    respawnMs: 3000,
+  },
 };

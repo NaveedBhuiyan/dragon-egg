@@ -39,7 +39,9 @@ export default class GameScene extends Phaser.Scene {
     }
   }
 
-  create() {
+  create(data) {
+    this.mode = data?.mode === 'guardianRaider' ? 'guardianRaider' : 'solo';
+
     this.inventory = { ember: 0, frost: 0, storm: 0 };
     this.totalCollected = { ember: 0, frost: 0, storm: 0 };
     this.nestLevel = 0;
@@ -55,9 +57,12 @@ export default class GameScene extends Phaser.Scene {
     this.transientMessage = '';
     this.transientMessageUntil = 0;
     this.raiders = [];
+    this.humanRaider = null;
 
     this.inputState = { moveX: 0, moveY: 0, interact: false, eggAction: false, attack: false };
+    this.raiderInputState = { moveX: 0, moveY: 0, attack: false };
     this.keyboardMoving = false;
+    this.raiderKeyboardMoving = false;
     this.isTouch = this.sys.game.device.input.touch;
     this.compactHud = false;
     this.safeArea = this.probeSafeArea();
@@ -96,8 +101,12 @@ export default class GameScene extends Phaser.Scene {
 
     this.layoutHud(this.scale.width, this.scale.height);
 
-    this.scheduleTierIncrease();
-    this.scheduleNextSpawn();
+    if (this.mode === 'guardianRaider') {
+      this.spawnHumanRaider();
+    } else {
+      this.scheduleTierIncrease();
+      this.scheduleNextSpawn();
+    }
   }
 
   // ---------- animations ----------
@@ -355,18 +364,25 @@ export default class GameScene extends Phaser.Scene {
     this.input.keyboard.on('keydown-SPACE', () => {
       this.inputState.attack = true;
     });
+    this.input.keyboard.on('keydown-ENTER', () => {
+      if (this.mode === 'guardianRaider') this.raiderInputState.attack = true;
+    });
     this.input.keyboard.on('keydown-R', () => {
-      if (this.gameOver || this.gameWon) this.scene.restart();
+      if (this.gameOver || this.gameWon) this.scene.restart({ mode: this.mode });
     });
   }
 
   pollKeyboardMovement() {
+    // In 2-player local-test mode the arrow keys drive the Raider instead of
+    // doubling up on the Guardian, so both roles can share one keyboard.
+    const arrowsControlGuardian = this.mode !== 'guardianRaider';
+
     let dx = 0;
     let dy = 0;
-    if (this.keys.left.isDown || this.keys.left2.isDown) dx -= 1;
-    if (this.keys.right.isDown || this.keys.right2.isDown) dx += 1;
-    if (this.keys.up.isDown || this.keys.up2.isDown) dy -= 1;
-    if (this.keys.down.isDown || this.keys.down2.isDown) dy += 1;
+    if (this.keys.left.isDown || (arrowsControlGuardian && this.keys.left2.isDown)) dx -= 1;
+    if (this.keys.right.isDown || (arrowsControlGuardian && this.keys.right2.isDown)) dx += 1;
+    if (this.keys.up.isDown || (arrowsControlGuardian && this.keys.up2.isDown)) dy -= 1;
+    if (this.keys.down.isDown || (arrowsControlGuardian && this.keys.down2.isDown)) dy += 1;
 
     if (dx !== 0 || dy !== 0) {
       const len = Math.hypot(dx, dy);
@@ -377,6 +393,26 @@ export default class GameScene extends Phaser.Scene {
       this.inputState.moveX = 0;
       this.inputState.moveY = 0;
       this.keyboardMoving = false;
+    }
+
+    if (this.mode === 'guardianRaider') {
+      let rdx = 0;
+      let rdy = 0;
+      if (this.keys.left2.isDown) rdx -= 1;
+      if (this.keys.right2.isDown) rdx += 1;
+      if (this.keys.up2.isDown) rdy -= 1;
+      if (this.keys.down2.isDown) rdy += 1;
+
+      if (rdx !== 0 || rdy !== 0) {
+        const rlen = Math.hypot(rdx, rdy);
+        this.raiderInputState.moveX = rdx / rlen;
+        this.raiderInputState.moveY = rdy / rlen;
+        this.raiderKeyboardMoving = true;
+      } else if (this.raiderKeyboardMoving) {
+        this.raiderInputState.moveX = 0;
+        this.raiderInputState.moveY = 0;
+        this.raiderKeyboardMoving = false;
+      }
     }
   }
 
@@ -392,6 +428,10 @@ export default class GameScene extends Phaser.Scene {
     if (this.inputState.attack) {
       this.inputState.attack = false;
       this.handleAttack();
+    }
+    if (this.mode === 'guardianRaider' && this.raiderInputState.attack) {
+      this.raiderInputState.attack = false;
+      this.handleRaiderAttack();
     }
   }
 
@@ -565,31 +605,48 @@ export default class GameScene extends Phaser.Scene {
     this.pollKeyboardMovement();
     this.consumeInputActions();
     this.updatePlayerMovement(delta);
-    this.updateRaiders(time, delta);
+
+    if (this.mode === 'guardianRaider') {
+      this.updateHumanRaider(delta);
+    } else {
+      this.updateRaiders(time, delta);
+    }
+
     this.updateNodesVisuals();
     this.updateTouchControls();
     this.updateHud(time);
   }
 
-  updatePlayerMovement(delta) {
-    const dx = this.inputState.moveX;
-    const dy = this.inputState.moveY;
-
-    if (dx !== 0 || dy !== 0) {
-      const speed = BALANCE.playerSpeed * (this.carrying ? BALANCE.carrySpeedMultiplier : 1);
+  // Moves a container+body pair by a normalized direction vector, flipping
+  // on horizontal facing and switching walk/idle animation. Shared by the
+  // Guardian (keyboard/touch input) and the human-controlled Raider.
+  moveCharacter(container, body, moveX, moveY, speed, delta, currentFacing) {
+    if (moveX !== 0 || moveY !== 0) {
       const dist = (speed * delta) / 1000;
-      this.playerContainer.x = Phaser.Math.Clamp(this.playerContainer.x + dx * dist, 20, WORLD.width - 20);
-      this.playerContainer.y = Phaser.Math.Clamp(this.playerContainer.y + dy * dist, 20, WORLD.height - 20);
+      container.x = Phaser.Math.Clamp(container.x + moveX * dist, 20, WORLD.width - 20);
+      container.y = Phaser.Math.Clamp(container.y + moveY * dist, 20, WORLD.height - 20);
 
-      if (dx !== 0) {
-        this.playerFacing = dx < 0 ? -1 : 1;
-      }
-      this.playerBody.setFlipX(this.playerFacing < 0);
-      this.playerBody.play('dragon-walk', true);
-    } else {
-      this.playerBody.play('dragon-idle', true);
+      const facing = moveX !== 0 ? (moveX < 0 ? -1 : 1) : currentFacing;
+      body.setFlipX(facing < 0);
+      body.play('dragon-walk', true);
+      return facing;
     }
 
+    body.play('dragon-idle', true);
+    return currentFacing;
+  }
+
+  updatePlayerMovement(delta) {
+    const speed = BALANCE.playerSpeed * (this.carrying ? BALANCE.carrySpeedMultiplier : 1);
+    this.playerFacing = this.moveCharacter(
+      this.playerContainer,
+      this.playerBody,
+      this.inputState.moveX,
+      this.inputState.moveY,
+      speed,
+      delta,
+      this.playerFacing
+    );
     this.playerEgg.setVisible(this.carrying);
   }
 
@@ -733,8 +790,24 @@ export default class GameScene extends Phaser.Scene {
   killRaider(raider) {
     raider.dead = true;
     this.raidersDefeated += 1;
+
+    if (raider.isHuman) {
+      raider.container.setVisible(false);
+      raider.hpBarGfx.clear();
+      this.time.delayedCall(BALANCE.raiderPvp.respawnMs, () => this.respawnHumanRaider(raider));
+      return;
+    }
+
     raider.container.destroy();
     raider.hpBarGfx.destroy();
+  }
+
+  respawnHumanRaider(raider) {
+    if (this.gameOver || this.gameWon) return;
+    const { x, y } = this.randomEdgePoint();
+    raider.container.setPosition(x, y).setVisible(true);
+    raider.hp = raider.maxHp;
+    raider.dead = false;
   }
 
   // ---------- nest ----------
@@ -868,22 +941,98 @@ export default class GameScene extends Phaser.Scene {
         }
       }
 
-      raider.hpBarGfx.clear();
-      const barWidth = 26;
-      raider.hpBarGfx.fillStyle(0x000000, 0.5);
-      raider.hpBarGfx.fillRect(raider.container.x - barWidth / 2, raider.container.y - 26, barWidth, 5);
-      raider.hpBarGfx.fillStyle(0xef4444, 1);
-      raider.hpBarGfx.fillRect(
-        raider.container.x - barWidth / 2,
-        raider.container.y - 26,
-        barWidth * Phaser.Math.Clamp(raider.hp / raider.maxHp, 0, 1),
-        5
-      );
+      this.drawRaiderHpBar(raider);
     }
 
     if (this.raiders.length > 40) {
       this.raiders = this.raiders.filter((r) => !r.dead);
     }
+  }
+
+  drawRaiderHpBar(raider) {
+    raider.hpBarGfx.clear();
+    const barWidth = 26;
+    raider.hpBarGfx.fillStyle(0x000000, 0.5);
+    raider.hpBarGfx.fillRect(raider.container.x - barWidth / 2, raider.container.y - 26, barWidth, 5);
+    raider.hpBarGfx.fillStyle(0xef4444, 1);
+    raider.hpBarGfx.fillRect(
+      raider.container.x - barWidth / 2,
+      raider.container.y - 26,
+      barWidth * Phaser.Math.Clamp(raider.hp / raider.maxHp, 0, 1),
+      5
+    );
+  }
+
+  // ---------- human-controlled raider (2-player mode) ----------
+
+  spawnHumanRaider() {
+    const { x, y } = this.randomEdgePoint();
+    const hp = BALANCE.raiderPvp.hp;
+
+    const body = this.add
+      .sprite(0, 6, 'dragon_walk_01')
+      .setScale(SPRITE_SCALE.raider)
+      .setOrigin(0.5, 0.75)
+      .setTint(0xdc2626);
+    body.play('dragon-idle');
+    const container = this.add.container(x, y, [body]);
+    const hpBarGfx = this.add.graphics();
+
+    this.humanRaider = {
+      container,
+      body,
+      hpBarGfx,
+      hp,
+      maxHp: hp,
+      speed: BALANCE.raiderPvp.speed,
+      facing: 1,
+      attackElapsed: 0,
+      lastAttackTime: -Infinity,
+      dead: false,
+      isHuman: true,
+    };
+    this.raiders.push(this.humanRaider);
+  }
+
+  updateHumanRaider(delta) {
+    const raider = this.humanRaider;
+    if (!raider || raider.dead) return;
+
+    raider.facing = this.moveCharacter(
+      raider.container,
+      raider.body,
+      this.raiderInputState.moveX,
+      this.raiderInputState.moveY,
+      raider.speed,
+      delta,
+      raider.facing
+    );
+
+    this.drawRaiderHpBar(raider);
+  }
+
+  handleRaiderAttack() {
+    const raider = this.humanRaider;
+    if (!raider || raider.dead || this.gameOver || this.gameWon) return;
+    if (this.time.now - raider.lastAttackTime < BALANCE.attack.cooldownMs) return;
+    raider.lastAttackTime = this.time.now;
+
+    const ring = this.add.circle(raider.container.x, raider.container.y, BALANCE.attack.range, 0xef4444, 0.25);
+    this.tweens.add({
+      targets: ring,
+      alpha: 0,
+      scale: 1.3,
+      duration: 220,
+      onComplete: () => ring.destroy(),
+    });
+
+    const eggPos = this.eggWorldPosition();
+    const d = Phaser.Math.Distance.Between(raider.container.x, raider.container.y, eggPos.x, eggPos.y);
+    if (d > BALANCE.attack.range) return;
+
+    const nestDefense = BALANCE.nestLevels[this.nestLevel] ? BALANCE.nestLevels[this.nestLevel].defenseMultiplier : 1;
+    const multiplier = this.carrying ? 1 : nestDefense;
+    this.damageEgg(BALANCE.raiderPvp.eggDamage * multiplier);
   }
 
   damageEgg(amount) {

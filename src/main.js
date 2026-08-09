@@ -1,4 +1,5 @@
 import Phaser from 'phaser';
+import ModeSelectScene from './scenes/ModeSelectScene.js';
 import GameScene from './scenes/GameScene.js';
 import './style.css';
 
@@ -14,5 +15,5 @@ new Phaser.Game({
   input: {
     activePointers: 3,
   },
-  scene: [GameScene],
+  scene: [ModeSelectScene, GameScene],
 });
